@@ -1,0 +1,20 @@
+### health
+GET http://localhost:8082/health
+
+### safe
+POST http://localhost:8082/v1/analyze
+Content-Type: application/json
+
+{
+  "code": "import math\nprint(math.pi)",
+  "language": "python"
+}
+
+### danger
+POST http://localhost:8082/v1/analyze
+Content-Type: application/json
+
+{
+  "code": "import subprocess\nsubprocess.Popen(['bash','-c','rm -rf /'])",
+  "language": "python"
+}
