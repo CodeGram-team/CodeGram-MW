@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 class AnalyzeRequest(BaseModel):
     # Received payload: only code text and optional language hint.
@@ -11,14 +11,15 @@ class AnalyzeResponse(BaseModel):
     risk_score: int
     decision: str
     language: str
-    blocked_rules: List[str] = []
-    reasons: List[str] = []
-    suggested_limits: Dict[str, int] = {}
-    # Emoji fields: make defaults so missing values won't cause ValidationError
+    blocked_rules: List[str]
+    reasons: List[str]
+    suggested_limits: Dict[str, int]
+    emojis: List[str]
+    emoji_labels: List[str]
     emoji_ids: List[str] = []
-    emojis: List[str] = []
-    emoji_labels: List[str] = []
-    tags: List[str] = []
-    style: Dict[str, Any] = {}
-    scores: Dict[str, float] = {}
+    tags: List[str]
+    style: Dict[str, Any]
     version: str
+
+    fallback_used: Optional[bool] = False
+    openai_usage: Optional[Dict[str, int]] = None

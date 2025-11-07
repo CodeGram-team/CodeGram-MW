@@ -1,0 +1,301 @@
+# app/emoji/openai_tagger.py
+"""
+OpenAI-based emoji tagger for malware-emoji-service.
+
+- Uses OpenAI Responses API (e.g. "gpt-5-mini") to request emoji tags for a code snippet.
+- Removes unsafe parameters (no 'temperature' passed).
+- Robust parsing for truncated outputs; extracts first JSON object from the model text.
+- Caches results in /tmp to avoid repeated calls for identical code.
+- Falls back to a provided local_fallback_callable when OpenAI fails or returns insufficient results.
+"""
+
+from __future__ import annotations
+import os
+import json
+import re
+import time
+import hashlib
+import logging
+from typing import Dict, Any, List, Optional
+
+# OpenAI SDK import
+try:
+    from openai import OpenAI
+    from openai import error as openai_error
+except Exception as e:
+    raise RuntimeError("OpenAI SDK is required. Install with `pip install openai`") from e
+
+logger = logging.getLogger("openai_tagger")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# API key from environment
+_API_KEY = os.environ.get("OPENAI_API_KEY")
+if not _API_KEY:
+    logger.warning("OPENAI_API_KEY environment variable is not set. OpenAI calls will fail until set.")
+_client = OpenAI(api_key=_API_KEY) if _API_KEY else None
+
+# Allowed emoji definitions (id,label,emoji)
+ALLOWED_EMOJI = [
+  {"id":"toss_star","label":"stars","emoji":"⭐"},
+  {"id":"toss_ascii","label":"ascii_art","emoji":"🖼️"},
+  {"id":"toss_chart","label":"chart","emoji":"📈"},
+  {"id":"toss_table","label":"table","emoji":"📊"},
+  {"id":"toss_data","label":"data_processing","emoji":"🧪"},
+  {"id":"toss_ml","label":"machine_learning","emoji":"🤖"},
+  {"id":"toss_dl","label":"deep_learning","emoji":"🧠"},
+  {"id":"toss_web","label":"web","emoji":"🌐"},
+  {"id":"toss_api","label":"api","emoji":"🔌"},
+  {"id":"toss_db","label":"database","emoji":"🛢️"},
+  {"id":"toss_io","label":"io","emoji":"📎"},
+  {"id":"toss_sys","label":"system","emoji":"🛠️"},
+  {"id":"toss_net","label":"networking","emoji":"🔗"},
+  {"id":"toss_crypto","label":"crypto","emoji":"🔐"},
+  {"id":"toss_async","label":"async","emoji":"⚡"},
+  {"id":"toss_test","label":"testing","emoji":"✅"},
+  {"id":"toss_algo","label":"algorithm","emoji":"⚙️"},
+  {"id":"toss_math","label":"math","emoji":"➗"},
+  {"id":"toss_visual","label":"ui_visual","emoji":"🎨"},
+  {"id":"toss_game","label":"game","emoji":"🎮"},
+  {"id":"toss_devops","label":"devops","emoji":"🔧"},
+  {"id":"toss_monitor","label":"monitoring","emoji":"📡"},
+  {"id":"toss_stream","label":"stream","emoji":"🔁"},
+  {"id":"toss_regex","label":"parsing","emoji":"🔍"},
+  {"id":"toss_image","label":"image","emoji":"🖼️"},
+  {"id":"toss_audio","label":"audio","emoji":"🎧"},
+  {"id":"toss_robot","label":"automation","emoji":"🤖"},
+  {"id":"toss_security","label":"security","emoji":"🛡️"},
+  {"id":"toss_text","label":"nlp","emoji":"📝"},
+  {"id":"toss_fun","label":"fun_snippet","emoji":"😄"},
+  {"id":"toss_script","label":"script","emoji":"🐍"},
+]
+
+ALLOWED_IDS = {e["id"] for e in ALLOWED_EMOJI}
+LABEL_TO_ID = {e["label"]: e["id"] for e in ALLOWED_EMOJI}
+
+PROMPT_TEMPLATE = """
+You are a code analyst. NEVER execute the code. Return exactly one JSON object and nothing else.
+
+Allowed emoji ids and labels:
+{allowed_json}
+
+Return exactly this schema:
+{{
+  "emoji_ids": ["<id>", ...],
+  "emoji_labels": ["<label>", ...],
+  "emojis": ["<unicode>", ...],
+  "reasons": ["short reason", ...],
+  "confidence": "low|medium|high"
+}}
+
+Rules:
+- Use only ids from the allowed list above. If none apply, return empty arrays.
+- If you are confident, return at least 2 emoji_ids. If not confident, return 1 and set confidence to 'low'.
+- No extra commentary, no code fences, JSON only.
+
+Analyze code between ===CODE_START=== and ===CODE_END=== and return only the JSON.
+===CODE_START===
+{code}
+===CODE_END===
+""".strip()
+
+# simple secret redaction
+SECRET_PATTERNS = [
+    r"(?:API_KEY|SECRET|TOKEN)(\s*[:=]\s*)[\"']?[^\"'\s]+[\"']?",
+    r"(?i)password(\s*[:=]\s*)[\"']?[^\"'\s]+[\"']?"
+]
+
+def mask_secrets(code: str) -> str:
+    s = code
+    for pat in SECRET_PATTERNS:
+        s = re.sub(pat, r"\1\"<REDACTED>\"", s)
+    return s
+
+def _extract_first_json(text: str) -> Optional[str]:
+    if not text:
+        return None
+    # normalize common code fences
+    text = re.sub(r"```(?:json|text|bash)?\n?", "", text, flags=re.IGNORECASE).strip()
+    start = text.find("{")
+    if start == -1:
+        return None
+    stack = 0
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == "{":
+            stack += 1
+        elif c == "}":
+            stack -= 1
+            if stack == 0:
+                return text[start:i+1]
+    return None
+
+def _collect_text_from_response(resp: Any) -> str:
+    pieces: List[str] = []
+    text = getattr(resp, "output_text", None)
+    if text:
+        pieces.append(text)
+    out = getattr(resp, "output", None) or []
+    if isinstance(out, list):
+        for item in out:
+            try:
+                content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+            except Exception:
+                content = None
+            if content and isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "output_text":
+                        pieces.append(c.get("text", ""))
+                    elif isinstance(c, str):
+                        pieces.append(c)
+            else:
+                t = None
+                try:
+                    t = item.get("text") if isinstance(item, dict) else getattr(item, "text", None)
+                except Exception:
+                    t = None
+                if t:
+                    pieces.append(t)
+    return "\n".join([p for p in pieces if p]).strip()
+
+def _call_responses(prompt: str, model: str, max_output_tokens: int, timeout: int):
+    global _client
+    if _client is None:
+        _API_KEY = os.environ.get("OPENAI_API_KEY")
+        if not _API_KEY:
+            raise RuntimeError("OpenAI API key missing: set OPENAI_API_KEY in environment")
+        logger.info("Initializing OpenAI client at runtime from environment")
+        _client = OpenAI(api_key=_API_KEY)
+
+    try:
+        # NOTE: do NOT pass 'temperature' here; some Responses models reject it.
+        return _client.responses.create(
+            model=model,
+            input=prompt,
+            max_output_tokens=max_output_tokens,
+            timeout=timeout,
+        )
+    except openai_error.BadRequestError as e:
+        msg = str(e).lower()
+        logger.warning("OpenAI BadRequestError: %s", msg)
+        # if the model complains about other unsupported parameters, re-raise
+        raise
+
+def ask_gpt_for_emojis(code: str, model: str = "gpt-5-mini", timeout: int = 20) -> Dict[str, Any]:
+    h = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    cache_path = f"/tmp/emoji_cache_{h}.json"
+    if os.path.exists(cache_path):
+        try:
+            logger.info("Cache hit for code hash=%s", h)
+            return json.load(open(cache_path, "r", encoding="utf-8"))
+        except Exception:
+            logger.exception("Failed to read cache %s", cache_path)
+
+    prompt = PROMPT_TEMPLATE.format(allowed_json=json.dumps([{"id": e["id"], "label": e["label"]} for e in ALLOWED_EMOJI], ensure_ascii=False), code=mask_secrets(code))
+
+    max_tokens_try = [800, 1600]
+    last_exc: Optional[Exception] = None
+    for tk in max_tokens_try:
+        try:
+            logger.info("OpenAI: calling model=%s for code hash=%s with max_output_tokens=%d", model, h, tk)
+            resp = _call_responses(prompt, model, tk, timeout)
+            text = _collect_text_from_response(resp)
+            logger.info("OpenAI: collected text length=%d for hash=%s incomplete=%s", len(text), h, getattr(resp, "incomplete_details", None) is not None)
+
+            # If truncated/incomplete, attempt extraction and possibly retry
+            if getattr(resp, "incomplete_details", None) is not None:
+                logger.warning("OpenAI response incomplete for hash=%s: %s", h, getattr(resp, "incomplete_details"))
+                candidate = _extract_first_json(text)
+                if candidate:
+                    try:
+                        obj = json.loads(candidate)
+                        logger.info("Extracted JSON from truncated response for hash=%s", h)
+                    except Exception as e:
+                        logger.exception("JSON parse failed for truncated candidate for hash=%s: %s", h, e)
+                        raise RuntimeError("Truncated and parse failed")
+                else:
+                    raise RuntimeError("Truncated and no JSON found")
+
+            candidate = _extract_first_json(text)
+            if not candidate:
+                raise RuntimeError("No JSON object found in model output")
+
+            obj = json.loads(candidate)
+            ids = [i for i in obj.get("emoji_ids", []) if i in ALLOWED_IDS]
+            labels = obj.get("emoji_labels", [])[:len(ids)]
+            emojis = obj.get("emojis", [])[:len(ids)]
+            reasons = obj.get("reasons", [])[:len(ids)]
+            confidence = obj.get("confidence", "low")
+            res = {"emoji_ids": ids, "emoji_labels": labels, "emojis": emojis, "reasons": reasons, "confidence": confidence}
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(res, f, ensure_ascii=False)
+            except Exception:
+                logger.exception("Failed to write cache %s", cache_path)
+            logger.info("OpenAI: returned %d emoji_ids for code hash=%s", len(ids), h)
+            return res
+
+        except Exception as e:
+            last_exc = e
+            logger.exception("Attempt with max_output_tokens=%d failed for hash=%s: %s", tk, h, e)
+            time.sleep(1.5)
+            continue
+
+    logger.error("All OpenAI attempts failed for hash=%s; raising last exception", h)
+    raise last_exc if last_exc else RuntimeError("OpenAI call failed without specific exception")
+
+def _normalize_local_result(local: Dict[str, Any]) -> Dict[str, Any]:
+    ids = []
+    labels = []
+    emojis = []
+    reasons = local.get("reasons", []) or []
+    for i, lab in enumerate(local.get("emoji_labels", []) or []):
+        candidate_id = None
+        try:
+            lid = (local.get("emoji_ids", []) or [])[i]
+        except Exception:
+            lid = None
+        if lid and lid in ALLOWED_IDS:
+            candidate_id = lid
+        if not candidate_id:
+            if lab and lab in LABEL_TO_ID:
+                candidate_id = LABEL_TO_ID[lab]
+        if not candidate_id:
+            candidate_id = "toss_fun"
+        ids.append(candidate_id)
+        labels.append(next((e["label"] for e in ALLOWED_EMOJI if e["id"] == candidate_id), candidate_id))
+        emojis.append(next((e["emoji"] for e in ALLOWED_EMOJI if e["id"] == candidate_id), ""))
+    return {"emoji_ids": ids, "emoji_labels": labels, "emojis": emojis, "reasons": reasons, "confidence": "low"}
+
+def get_openai_emojis_safe(code: str, local_fallback_callable=None) -> Dict[str, Any]:
+    """
+    Public function to get emoji tags for code.
+    If OpenAI fails or returns insufficient ids (<2), local_fallback_callable (if provided) will be used.
+    """
+    try:
+        res = ask_gpt_for_emojis(code)
+        res.setdefault("confidence", "low")
+        if len(res.get("emoji_ids", [])) < 2 and callable(local_fallback_callable):
+            local = local_fallback_callable(code) or {}
+            norm = _normalize_local_result(local)
+            for j, eid in enumerate(norm.get("emoji_ids", [])):
+                if eid not in res.get("emoji_ids", []):
+                    res["emoji_ids"].append(eid)
+                    res["emoji_labels"].append(norm["emoji_labels"][j])
+                    res["emojis"].append(norm["emojis"][j])
+                    res["reasons"].append("local-fallback")
+                if len(res["emoji_ids"]) >= 2:
+                    break
+        res["fallback_used"] = False
+        return res
+    except Exception as e:
+        logger.exception("get_openai_emojis_safe: OpenAI failed, falling back to local. %s", e)
+        if callable(local_fallback_callable):
+            local = local_fallback_callable(code) or {}
+            norm = _normalize_local_result(local)
+            norm["fallback_used"] = True
+            return norm
+        return {"emoji_ids": [], "emoji_labels": [], "emojis": [], "reasons": [], "confidence": "low", "fallback_used": True}
